@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+opencv-python
+torch
+torchvision
+ffmpeg
+numpy  # 新增的依赖
+python-multipart
+aiortc
