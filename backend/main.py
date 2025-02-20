@@ -1,13 +1,16 @@
 import os
 import torch
+import torch.nn as nn
 import numpy as np
-import av
 import ffmpeg
 import shutil
-import threading
-from fastapi import FastAPI, UploadFile, File, HTTPException
+import asyncio
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+
+import cv2
+
 
 app = FastAPI()
 
@@ -33,25 +36,54 @@ processing_status = {"status": "idle", "progress": 0, "file": None}
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"🚀 使用设备: {device}")
 
-def bicubic_upsample(frame, scale_factor=4):
-    """ 在 GPU 上进行 Bicubic 插值 """
-    frame = frame.unsqueeze(0).to(device)  # ✅ 送入 GPU
-    upsampled_frame = torch.nn.functional.interpolate(
-        frame, scale_factor=scale_factor, mode="bicubic", align_corners=False
-    ).squeeze(0)
-    return (upsampled_frame * 255).clamp(0, 255).to(torch.uint8).cpu()  # ✅ 取回 CPU 方便处理
+# 最大文件大小（500MB）
+MAX_FILE_SIZE = 500 * 1024 * 1024
 
-def upscale_video_ffmpeg(input_path, output_path):
-    """ 逐帧读取视频，进行 Bicubic 超分辨率，并直接写入 FFmpeg """
+# 批处理大小（batch_size）
+BATCH_SIZE = 16
+
+
+# ✅ 加载超分模型
+from tools import load_sr_model
+sr_model = load_sr_model("FSRCNN",4,device)
+
+
+async def super_resolve_batch(frames):
+    """ 使用 FSRCNN 进行超分辨率处理 """
+    frames = frames.to(device)  
+    with torch.no_grad():  # 关闭梯度计算，加速推理
+        upsampled_frames = sr_model(frames)
+    return (upsampled_frames * 255).clamp(0, 255).to(torch.uint8).cpu()
+
+async def upscale_cbcr_batch(cb_batch, cr_batch, target_size):
+    """ 执行 CbCr 插值（仍然是异步） """
+    loop = asyncio.get_running_loop()
+    cb_resized_list = await loop.run_in_executor(None, lambda: [cv2.resize(cb, target_size, interpolation=cv2.INTER_NEAREST) for cb in cb_batch])
+    cr_resized_list = await loop.run_in_executor(None, lambda: [cv2.resize(cr, target_size, interpolation=cv2.INTER_NEAREST) for cr in cr_batch])
+    return cb_resized_list, cr_resized_list
+
+
+
+async def upscale_video_ffmpeg(input_path, output_path):
+    """ 逐帧读取视频，进行批量超分辨率处理，并直接写入 FFmpeg """
     print(f"📥 读取视频: {input_path}")
     processing_status["status"] = "processing"
     processing_status["progress"] = 0
     processing_status["file"] = output_path
 
     # 读取视频信息
-    probe = ffmpeg.probe(input_path)
-    video_info = next(s for s in probe["streams"] if s["codec_type"] == "video")
+    try:
+        probe = ffmpeg.probe(input_path)
+        video_info = next((s for s in probe["streams"] if s["codec_type"] == "video"), None)
+        if not video_info:
+            raise ValueError("No video stream found")
+    except ffmpeg.Error as e:
+        print("❌ FFmpeg probe error:", e)
+        processing_status["status"] = "error"
+        return
+
     width, height = int(video_info["width"]), int(video_info["height"])
+    total_frames = int(video_info.get("nb_frames", 1000))  # 估算总帧数
     fps = eval(video_info["r_frame_rate"])
 
     process_in = (
@@ -62,33 +94,83 @@ def upscale_video_ffmpeg(input_path, output_path):
 
     process_out = (
         ffmpeg.input("pipe:", format="rawvideo", pix_fmt="rgb24", s=f"{width*4}x{height*4}", r=fps)
-        .output(output_path, pix_fmt="yuv420p", vcodec="libx264", r=fps)
+        .output(output_path, pix_fmt="yuv420p", vcodec="libx264", r=fps)#, crf=23, preset="fast") 
         .overwrite_output()
         .run_async(pipe_stdin=True)
     )
 
     frame_size = width * height * 3
     frame_count = 0
+    frame_buffer = []
+    cb_buffer = []
+    cr_buffer = []
 
     while True:
         raw_frame = process_in.stdout.read(frame_size)
         if not raw_frame:
             break
 
+        # 读取帧并存入批量缓冲区
         frame = np.frombuffer(raw_frame, np.uint8).reshape(height, width, 3)
-        frame_tensor = torch.tensor(frame, dtype=torch.float32).permute(2, 0, 1) / 255.0
+        
+        # ✅ 1. 转换为 YCbCr 格式（交换 Cb 和 Cr）
+        frame_ycbcr = cv2.cvtColor(frame, cv2.COLOR_RGB2YCrCb)
+        y_channel = frame_ycbcr[:, :, 0]
+        cb_channel = frame_ycbcr[:, :, 2]  # 交换 Cb 和 Cr
+        cr_channel = frame_ycbcr[:, :, 1]
 
-        # ✅ 逐帧 GPU 处理
-        upsampled_frame = bicubic_upsample(frame_tensor)
-        upsampled_img = upsampled_frame.permute(1, 2, 0).numpy().astype(np.uint8)
+        # 归一化 Y 通道并存入 buffer
+        y_tensor = torch.tensor(y_channel, dtype=torch.float32).unsqueeze(0) / 255.0  # [1, H, W]
+        frame_buffer.append(y_tensor)
 
-        # ✅ 逐帧写入 FFmpeg
-        process_out.stdin.write(upsampled_img.tobytes())
+        # 存入 CbCr 通道
+        cb_buffer.append(cb_channel)
+        cr_buffer.append(cr_channel)
+
+        if len(frame_buffer) >= BATCH_SIZE:
+            batch_tensor = torch.stack(frame_buffer).to(device)  # [B, 1, H, W]
+            target_size = (width * 4, height * 4)
+
+            # ✅ 串行执行（先 Y 超分，再 CbCr 插值）
+            upsampled_y = await super_resolve_batch(batch_tensor)  # 1. Y 超分
+            upsampled_y = upsampled_y.squeeze(1).cpu().numpy().astype(np.uint8)  # [B, 4H, 4W]
+
+            cb_resized_list, cr_resized_list = await upscale_cbcr_batch(cb_buffer, cr_buffer, target_size)  # 2. CbCr 插值
+
+            # ✅ 3. 重新组合 YCbCr 并转换回 RGB
+            for i in range(BATCH_SIZE):
+                ycrcb_upsampled = np.stack([upsampled_y[i], cr_resized_list[i],cb_resized_list[i]], axis=2)
+                rgb_upsampled = cv2.cvtColor(ycrcb_upsampled, cv2.COLOR_YCrCb2RGB)
+                process_out.stdin.write(rgb_upsampled.tobytes())  # 写入 FFmpeg
+
+            # 清空缓冲区
+            frame_buffer = []
+            cb_buffer = []
+            cr_buffer = []
 
         frame_count += 1
         if frame_count % 10 == 0:
-            processing_status["progress"] = int((frame_count / 1000) * 100)
+            processing_status["progress"] = int((frame_count / total_frames) * 100)
             print(f"📈 处理进度: {processing_status['progress']}%")
+        
+        
+
+
+     # ✅ 处理剩余的帧
+    if frame_buffer:
+        batch_tensor = torch.stack(frame_buffer).to(device)
+        upsampled_y = await super_resolve_batch(batch_tensor)
+        upsampled_y = upsampled_y.squeeze(1).cpu().numpy().astype(np.uint8)
+
+        cb_resized_list, cr_resized_list = await upscale_cbcr_batch(cb_buffer, cr_buffer, (width * 4, height * 4))
+
+        batch_rgb_frames = []
+        for i in range(len(upsampled_y)):
+            ycrcb_upsampled = np.stack([upsampled_y[i], cr_resized_list[i],cb_resized_list[i]], axis=2)
+            rgb_upsampled = cv2.cvtColor(ycrcb_upsampled, cv2.COLOR_YCrCb2RGB)
+            batch_rgb_frames.append(rgb_upsampled)
+
+        process_out.stdin.write(np.array(batch_rgb_frames, dtype=np.uint8).tobytes())
 
     process_in.wait()
     process_out.stdin.close()
@@ -102,9 +184,15 @@ def upscale_video_ffmpeg(input_path, output_path):
         processing_status["status"] = "error"
         print("❌ 处理失败，文件未找到！")
 
+
+
+
 @app.post("/upload")
-async def upload_video(video: UploadFile = File(...)):
+async def upload_video(video: UploadFile = File(...), request: Request = None):
     """ 处理视频上传并异步超分 """
+    if request and int(request.headers.get("content-length", 0)) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail="File too large")
+
     file_path = os.path.join(UPLOAD_FOLDER, video.filename)
     output_path = os.path.join(OUTPUT_FOLDER, f"4k_{video.filename}")
 
@@ -114,24 +202,11 @@ async def upload_video(video: UploadFile = File(...)):
     processing_status["status"] = "queued"
     processing_status["progress"] = 0
 
-    # ✅ 启动新线程处理
-    processing_thread = threading.Thread(target=upscale_video_ffmpeg, args=(file_path, output_path))
-    processing_thread.start()
+    # ✅ 启动异步任务处理
+    asyncio.create_task(upscale_video_ffmpeg(file_path, output_path))
 
-    return {"message": "Processing started", "output": f"4k_{video.filename}"}
+    return JSONResponse({"message": "Processing started", "output": f"4k_{video.filename}"})
 
-@app.get("/status")
-async def get_status():
-    """ 获取处理状态 """
-    return JSONResponse(processing_status)
-
-@app.get("/videos/{filename}")
-async def get_video(filename: str):
-    """ 提供超分视频文件 """
-    file_path = os.path.join(OUTPUT_FOLDER, filename)
-    if not os.path.exists(file_path):
-        return JSONResponse({"error": "File not found"}, status_code=404)
-    return FileResponse(file_path, media_type="video/mp4")
 
 if __name__ == "__main__":
     import uvicorn
