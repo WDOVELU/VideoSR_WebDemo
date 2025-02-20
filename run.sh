@@ -13,6 +13,7 @@ sleep 2
 # 启动前端
 echo "🚀 启动前端（React）..."
 cd frontend
+npm install
 npm run dev > frontend.log 2>&1 &  # 前端运行日志写入 frontend.log
 FRONTEND_PID=$!  # 记录前端进程 ID
 cd ..
